@@ -1,146 +1,117 @@
-from collections import deque
-
-import cv2
 import numpy as np
+import pyrealsense2 as rs
+import os.path
+
+from time import time
+from detector import MotionDetector
+from packer import pack_images
 from numba import jit
-
-from bounding_boxes import scan, optimize_bounding_boxes
-
-MAX_DIMENSION = 100000000
-
-
-def gen_movement_frame(frames: list, shape):
-    acc = np.zeros(shape, dtype='float32')
-    i = 0
-    for f in frames:
-        i += 1
-        acc += f * i
-    acc = acc / ((1 + i) / 2 * i)
-    acc[acc > 254] = 255
-    return acc
 
 
 @jit(nopython=True)
-def numba_scale_box(b: (int, int, int, int), scale: float):
-    return int(b[0] / scale), int(b[1] / scale), int(b[2] / scale), int(b[3] / scale)
+def filter_fun(b):
+    return ((b[2] - b[0]) * (b[3] - b[1])) > 300
 
 
-class MotionDetector:
-    def __init__(self,
-                 bg_subs_scale_percent=0.25,
-                 bg_skip_frames=50,
-                 bg_history=15,
-                 movement_frames_history=5,  # what amount of frames to use for
-                 # current movement (to decrease the noise)
-                 brightness_discard_level=20,  # if the pixel brightness is lower than
-                 # this threshold, it's background
-                 pixel_compression_ratio=0.1,
-                 group_boxes=True,
-                 expansion_step=1):
-        self.bg_subs_scale_percent = bg_subs_scale_percent
-        self.bg_skip_frames = bg_skip_frames
-        self.bg_history = bg_history
-        self.group_boxes = group_boxes
-        self.expansion_step = expansion_step
-        self.movement_fps_history = movement_frames_history
-        self.brightness_discard_level = brightness_discard_level
-        self.pixel_compression_ratio = pixel_compression_ratio
+if __name__ == "__main__":
 
-        self.bg_frames = deque(maxlen=bg_history)
-        self.movement_frames = deque(maxlen=movement_frames_history)
-        self.orig_frames = deque(maxlen=movement_frames_history)
-        self.count = 0
-        self.background_acc = None
-        self.background_frame = None
-        self.boxes = None
-        self.movement = None
-        self.color_movement = None
-        self.gs_movement = None
-        self.detection = None
-        self.detection_boxed = None
-        self.frame = None
+    pipeline = rs.pipeline()
+    config = rs.config()
+    rs.config.enable_device_from_file(config,"file.bag")
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.rgb8, 15)
+    prof = pipeline.start(config)
+    
+    #when read from sensor
+    #s = prof.get_device().query_sensors()[1]
+    #s.set_option(rs.option.exposure, 450)
+    
+    colorizer = rs.colorizer();
+    cv2.namedWindow("Color Stream", cv2.WINDOW_AUTOSIZE)
+    	
+    detector = MotionDetector(bg_history=10,
+                              bg_skip_frames=5,
+                              movement_frames_history=5,
+                              brightness_discard_level=95,
+                              bg_subs_scale_percent=0.5,
+                              pixel_compression_ratio=0.5,
+                              group_boxes=True,
+                              expansion_step=5)
 
-    @classmethod
-    def prepare(cls, f, width, height):
-        return cv2.GaussianBlur(cv2.resize(f, (width, height), interpolation=cv2.INTER_CUBIC), (5, 5), 0)
+    # group_boxes=True can be used if one wants to get less boxes, which include all overlapping boxes
 
-    def __update_background(self, frame_fp32):
-        if not self.count % self.bg_skip_frames == 0:
-            return
+    b_height = 640
+    b_width = 480
+    frames = pipeline.wait_for_frames()
+    color_frame = frames.get_color_frame()
+    color_frame = np.asanyarray(color_frame.get_data())
+    #config.enable_record_to_file('arnest22.bag')
+    r = cv2.selectROI(color_frame,False, False)
+    print(r)
+    res = []
+    fc = dict()
+    ctr = 0
+    while True:
+        # Capture frame-by-frame
+        frames = pipeline.wait_for_frames()
+        color_frame = frames.get_color_frame()
+        color_frame = np.asanyarray(color_frame.get_data())
+        frame = color_frame
+        frame = frame[int(r[1]):int(r[1]+r[3]), int(r[0]):int(r[0]+r[2])]
 
-        if self.movement_frames.maxlen == len(self.movement_frames):
-            current_frame = self.movement_frames[0]
-        else:
-            current_frame = frame_fp32
+        #print(frame)
+        if frame is None:
+            break
 
-        if self.background_acc is None:
-            self.background_acc = frame_fp32
-        else:
-            self.background_acc = self.background_acc + current_frame
+        begin = time()
 
-            if self.bg_frames.maxlen == len(self.bg_frames):
-                subs_frame = self.bg_frames[0]
-                self.background_acc = self.background_acc - subs_frame
+        boxes, color_frame = detector.detect(frame)
+        # boxes hold all boxes around motion parts
 
-        self.bg_frames.append(current_frame)
+        ## this code cuts motion areas from initial image and
+        ## fills "bins" of 320x320 with such motion areas.
+        ##
+        results = []
+        if boxes:
+             results, box_map = pack_images(frame=frame, boxes=boxes, width=b_width, height=b_height,
+                                            box_filter=filter_fun)
+            # box_map holds list of mapping between image placement in packed bins and original boxes
 
-    def __detect_movement(self, frame_fp32):
-        self.movement_frames.append(frame_fp32)
-        movement_frame = gen_movement_frame(list(self.movement_frames), frame_fp32.shape)
-        self.background_frame = self.background_acc / len(self.bg_frames)
-        self.background_frame[self.background_frame > 254] = 255
-        if len(self.bg_frames):
-            movement = cv2.absdiff(movement_frame, self.background_frame)
-        else:
-            movement = np.zeros(movement_frame.shape)
-        self.color_movement = movement
-        movement[movement < self.brightness_discard_level] = 0
-        movement[movement > 0] = 254
-        movement = movement.astype('uint8')
-        movement = cv2.cvtColor(movement, cv2.COLOR_BGR2GRAY)
-        movement[movement > 0] = 254
-        return movement
+        ## end
 
-    def detect(self, f):
-        self.orig_frames.append(f)
-
-        width = int(f.shape[1] * self.bg_subs_scale_percent)
-        height = int(f.shape[0] * self.bg_subs_scale_percent)
-
-        detect_width = int(f.shape[1] * self.pixel_compression_ratio)
-        detect_height = int(f.shape[0] * self.pixel_compression_ratio)
-
-        self.frame = self.__class__.prepare(f, width, height)
-        nf_fp32 = self.frame.astype('float32')
-        self.__update_background(nf_fp32)
-
-        self.movement = self.__detect_movement(nf_fp32)
-        self.detection = cv2.resize(self.movement, (detect_width, detect_height), interpolation=cv2.INTER_CUBIC)
-        boxes = self.__get_movement_zones(self.detection)
-
-        self.count += 1
-
-        if self.movement_frames.maxlen != len(self.movement_frames) or self.bg_frames.maxlen != len(self.bg_frames):
-            return [], f
-
-        return boxes, self.orig_frames[0]
-
-    def __get_movement_zones(self, f):
-        boxes = []
-
-        # wait until the bg gets established to decrease the level of initial unstable noise
-        if len(self.bg_frames) >= self.bg_history / 2:
-            boxes = scan(f, self.expansion_step)
-            if self.group_boxes:
-                boxes = optimize_bounding_boxes(boxes)
-
-        self.detection_boxed = self.detection.copy()
         for b in boxes:
-            cv2.rectangle(self.detection_boxed, (b[0], b[1]), (b[2], b[3]), 250, 1)
+            cv2.rectangle(frame, (b[0], b[1]), (b[2], b[3]), (0, 0, 255), 1)
 
-        orig_boxes = []
-        for b in boxes:
-            orig_boxes.append(numba_scale_box(b, self.pixel_compression_ratio))
+        end = time()
+        it = (end - begin) * 1000
 
-        self.boxes = orig_boxes
-        return orig_boxes
+        res.append(it)
+        print("StdDev: %.4f" % np.std(res), "Mean: %.4f" % np.mean(res), "Last: %.4f" % it,
+              "Boxes found: ", len(boxes))
+
+        if len(res) > 10000:
+            res = []
+
+        # idx = 0
+        # for r in results:
+        #      idx += 1
+        #      cv2.imshow('packed_frame_%d' % idx, r)
+
+        ctr += 1
+        nc = len(results)
+        if nc in fc:
+            fc[nc] += 1
+        else:
+            fc[nc] = 0
+
+        if ctr % 100 == 0:
+            print("Total Frames: ", ctr, "Packed Frames:", fc)
+
+        
+        cv2.imshow("Color Stream", frame)
+        cv2.imshow('detect_frame', detector.detection_boxed)
+        cv2.imshow('diff_frame', detector.color_movement)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    print(fc, ctr)
